@@ -1,0 +1,168 @@
+## 背景
+我有一个input和一个panel板子，在做这个组件的过程中，我卡在了当我鼠标点击板子以外的区域，板子要收起来这个步骤上。
+
+## 遇到的问题
+原先想法： 原本就是监听document.body的mouseclick事件，target不是我的文本框就收起来（如何判断是不是我特定文本框，我用的是样式判断）这就会导致多个相同组件会同时触发这个回调，这显然不正确，后来又想说再加个唯一标识区分，但总觉得怪怪的，于是看了一下element-ui的实现。
+
+## 参考element-ui 的v-clickoutside
+我发现element-ui 中有很多组件都会有这种功能，然后我找了一个date-picker组件看了下。发现它实现了一个clickoutside的指令，然后就深入看了一下
+
+### 1.为什么用指令而没有直接写一个绑定函数
+参考了[使用Vue Directive封装DOM操作](https://elegenthus.github.io/post/VueDirectivesTest/)这篇文章，我觉得讲的很好，为什么要使用directive呢？
+> 这是因为，为了实现View和ViewModel的分离，我们必须封装DOM操作，View层负责页面上的显示，ViewModel层负责改变操作数据，由于Vue是数据驱动的，属于ViewModel层，那么其中就不应该出现View层上的DOM操作，且，使用Vue Directive是和DOM元素的创建、销毁绑定的。
+
+我个人觉得，最明显的优势在于vue指令中提供的钩子是与组件的生命周期关联的，利于我们绑定事件，销毁事件。
+
+### 2.指令基础
+| 钩子函数 | 描述 |
+| ------| ------ |
+| bind | 构造函数，第一次绑定时调用 |
+| update | bind之后以初始值调用一次，之后每当绑定值变化时调用
+|unbind| 组件销毁时调用
+
+| 属性 | 描述 |
+| ------| ------ |
+| el | 绑定指令的dom元素 |
+| vm | 上下文ViewModel |
+| expression | 指令表达式 |
+| arg | 参数 |
+| name | 指令id |
+| modifiers| 指令的修饰符 |
+|descriptor| 指令的解析结果
+
+### 探究clickouside 指令
+```javascript
+'use strict';
+var _dom = require('element-ui/lib/utils/dom');
+...
+var nodeList = [];
+var ctx = '@@clickoutsideContext';
+
+var startClick = void 0;
+var seed = 0;
+
+(0, _dom.on)(document, 'mousedown', function (e) {
+  return startClick = e;
+});
+
+(0, _dom.on)(document, 'mouseup', function (e) {
+  nodeList.forEach(function (node) {
+    return node[ctx].documentHandler(e, startClick);
+  });
+});
+
+function createDocumentHandler(el, binding, vnode) {
+  return function () {
+    var mouseup = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+    var mousedown = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+    if (el.contains(mouseup.target) || el.contains(mousedown.target) || el === mouseup.target || vnode.context.popperElm && (vnode.context.popperElm.contains(mouseup.target) || vnode.context.popperElm.contains(mousedown.target))) return;
+
+    if (binding.expression && el[ctx].methodName && vnode.context[el[ctx].methodName]) {
+      vnode.context[el[ctx].methodName]();
+    } else {
+      el[ctx].bindingFn && el[ctx].bindingFn();
+    }
+  };
+}
+
+/**
+ * v-clickoutside
+ * @desc 点击元素外面才会触发的事件
+ * @example
+ * ```vue
+ * <div v-element-clickoutside="handleClose">
+ * ```
+ */
+
+exports.default = {
+  bind: function bind(el, binding, vnode) {
+    nodeList.push(el);
+    var id = seed++;
+    el[ctx] = {
+      id: id,
+      documentHandler: createDocumentHandler(el, binding, vnode),
+      methodName: binding.expression,
+      bindingFn: binding.value
+    };
+  },
+  update: function update(el, binding, vnode) {
+    el[ctx].documentHandler = createDocumentHandler(el, binding, vnode);
+    el[ctx].methodName = binding.expression;
+    el[ctx].bindingFn = binding.value;
+  },
+  unbind: function unbind(el) {
+    var len = nodeList.length;
+    for (var i = 0; i < len; i++) {
+      if (nodeList[i][ctx].id === el[ctx].id) {
+        nodeList.splice(i, 1);
+        break;
+      }
+    }
+    delete el[ctx];
+  }
+};
+```
+element-ui 中这个可能考虑的事件比较多，写的偏复杂了一点，我就抽下大致的思路，然后写一个我要的
+* 当脚本加载时，就去监听document的mouseup事件
+* bind时我要将我绑定的node推入我的nodeList数组里，并且给我的node做上一个id标记
+* mouseup时，利用el.contains(el.target)来看是否是el之外的节点触发, 如果是以外的就出发我们的bind.expression对应的cb
+```javascript
+node.contains(otherNode)
+--------------------------
+This function checks to see if an element is in the page's body. As contains is inclusive and determining if the body contains itself isn't the intention of isInPage this case explicitly returns false.
+```
+* 解绑时只要删掉nodeList中对应的那个节点，如果移除整个事件，会影响其他组件
+
+所以我的指令就是下面这样:
+
+```javascript
+var nodeList = [];
+var ctx = '@@clickoutside';
+var seed = 0;
+
+var cb = (e) => {
+    var length = nodeList.length;
+    var target = e.target;
+    for (var i = 0; i < length; i++) {
+        if (!nodeList[i].contains(target)) {
+            nodeList[i][ctx].handler();
+        }
+    }
+}
+
+document.addEventListener('mouseup', cb);
+export default {
+    bind(el, binding, vnode) {
+        nodeList.push(el);
+        el[ctx] = {
+            id: seed++,
+            handler: function() {
+             // 注意通过vnode.context取到我们的cb  
+             vnode.context[binding.expression]();
+            }
+        }
+    },
+    unbind(el) {
+      // 注意这里不能直接removeEventListener这样会影响同一个页面上的同名组件的使用了
+        var len = nodeList.length;
+        for (var i = 0; i < len; i++) {
+            if (nodeList[i][ctx].id === el[ctx].id) {
+                nodeList.splice(i, 1);
+                break;
+            }
+        }
+        delete el[ctx];
+    }
+}
+```
+### 参考资料
+1.使用Vue Directive封装DOM操作
+https://elegenthus.github.io/post/VueDirectivesTest/
+2.Vue：指令(directive)简介
+https://axiu.me/coding/vue-directive/
+3.Vue.js 指令
+http://imweb.io/topic/570a12a906f2400432c139aa
+
+
+
+
